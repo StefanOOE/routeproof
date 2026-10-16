@@ -1,7 +1,5 @@
 # Routeproof – Route optimizer for LiteLLM
 
-> **Status:** concept, as of 16 Oct 2026. A spike against LiteLLM 1.105.1 has validated the approach; there is no usable code yet.
-
 ## Goal and principles
 
 Routeproof is an open-source plugin for the LiteLLM proxy (MIT license). It sends every prompt to the cheapest model that solves it well enough, and it measures whether that routing decision was right. LiteLLM stays the gateway and provides the OpenAI-compatible API, provider calls, keys and budgets. Routeproof hooks into the proxy, analyses and categorizes each prompt, picks the model and calibrates its choices from measured quality. The goal is the best cost/quality trade-off.
@@ -15,7 +13,7 @@ Routeproof is an open-source plugin for the LiteLLM proxy (MIT license). It send
 
 ## Architecture
 
-Routeproof runs as a hook inside the LiteLLM proxy (path B, decided on 16 Oct 2026). LiteLLM handles the gateway, master key and provider calls. Before routing, the proxy calls the Routeproof pre-call hook: directives, the analysis cascade, the router and prompt improvement set the target model there. LiteLLM callbacks deliver tokens, cost and messages to telemetry, from which Routeproof calibrates its quality matrix.
+Routeproof runs as a hook inside the LiteLLM proxy. LiteLLM handles the gateway, master key and provider calls. Before routing, the proxy calls the Routeproof pre-call hook: directives, the analysis cascade, the router and prompt improvement set the target model there. LiteLLM callbacks deliver tokens, cost and messages to telemetry, from which Routeproof calibrates its quality matrix.
 
 ![Architecture: request path on the left, measurement on the right](docs/images/architecture.png)
 
@@ -74,7 +72,7 @@ directives:
   strip_from_prompt: true
   position: leading          # only at the start of the message
   tiers:
-    local:    [qwen-code, qwen3.8, gemma4]
+    local:    [local-coder, local-general, local-small]
     standard: [claude-sonnet]
     premium:  [claude-opus]
   aliases:
@@ -115,8 +113,8 @@ Cost is kept simple: LiteLLM's `model_info` holds a fixed price per input and ou
 ```yaml
 # LiteLLM config.yaml (excerpt)
 model_list:
-  - model_name: qwen-code
-    litellm_params: {model: openai/qwen-code, api_base: http://gx10:8000/v1, api_key: none}
+  - model_name: local-coder
+    litellm_params: {model: openai/local-coder, api_base: http://gpu-server:8000/v1, api_key: none}
     model_info: {input_cost_per_token: 0.0, output_cost_per_token: 0.0}
   - model_name: claude-opus
     litellm_params: {model: anthropic/<model-id>, api_key: os.environ/ANTHROPIC_API_KEY}
@@ -129,12 +127,12 @@ litellm_settings:
 ```yaml
 # routeproof.yaml
 dispatcher:
-  model: qwen3.8-small
+  model: local-small
   confidence_threshold: 0.7
   cost_weight_lambda: 0.4      # 0 = quality only, 1 = cost only
 
 models:
-  qwen-code:
+  local-coder:
     tier: local
     privacy: local
     context_window: 32768
@@ -157,8 +155,6 @@ policies:
 ```
 
 Budgets per key, team and model are left to LiteLLM, which already enforces them.
-
-Note on “Claude Code”: Claude Code is a CLI agent, not a REST endpoint. The registry lists the Anthropic API with a Claude model, which LiteLLM calls like any other provider.
 
 ## Routing logic
 
@@ -183,8 +179,8 @@ U(m) = P(\text{good enough} \mid m, \text{category}, \text{complexity}) - \lambd
 
 For now, tenants are only labels for statistics, without user management (the proxy only requires a master key). Routeproof resolves them in this order:
 
-1. Headers `X-Tenant` and `X-Cost-Center` (tested in the spike)
-2. The `user` field of the OpenAI request (tested in the spike, logged as `end_user`)
+1. Headers `X-Tenant` and `X-Cost-Center`
+2. The `user` field of the OpenAI request (logged as `end_user`)
 3. LiteLLM virtual keys with team and alias, once Postgres is running
 4. Fallback `default`
 
@@ -214,11 +210,11 @@ Routing rests on one number: P(good enough | model, category, complexity). Cost 
 | 3 Shadow | sample also sent to premium, pairwise comparison | real money, budgeted | high |
 | 4 Golden set | 30–100 own prompts with checkable results | one-off | high, for cold start |
 
-**Level 0, passive signals:** Detected from API traffic alone via conversation detection. Regenerate = same history with the same last message shortly after. Error in follow-up = the next message contains a stack trace or “doesn't work”. Rephrasing = bge similarity to the previous message above 0.9. Technical defects = `finish_reason=length`, empty answer, refusal, invalid JSON or invalid tool calls. LiteLLM's adaptive router uses similar regex-based signals; Routeproof adds the levels below.
+**Level 0, passive signals:** Detected from API traffic alone via conversation detection. Regenerate = same history with the same last message shortly after. Error in follow-up = the next message contains a stack trace or “doesn't work”. Rephrasing = bge similarity to the previous message above 0.9. Technical defects = `finish_reason=length`, empty answer, refusal, invalid JSON or invalid tool calls.
 
 **Level 1, explicit feedback:** Every response carries the header `X-Routeproof-Id`. Feedback goes to `POST /routeproof/feedback {"id": "...", "score": 1|-1, "comment": "..."}` or via thumbs in the request explorer.
 
-**Level 2, LLM as judge:** A local model other than the one being rated (e.g. Gemma4) checks whether the answer is correct and complete. Limits: a judge only spots errors up to its own level, and models rate their own model family too favourably.
+**Level 2, LLM as judge:** A local model other than the one being rated (ideally from a different model family) checks whether the answer is correct and complete. Limits: a judge only spots errors up to its own level, and models rate their own model family too favourably.
 
 **Level 3, shadow routing:** The user gets the cheap model's answer. Asynchronously, the same prompt goes to the premium model, and the judge compares pairwise: “Is A at least as good as B?” Pairwise comparison works much better than absolute rating, even for weaker judges. The result directly answers whether premium would have been worth it.
 
@@ -250,9 +246,9 @@ Each cell (model × category × complexity) holds a beta distribution with a suc
 P = \frac{\alpha}{\alpha + \beta}
 ```
 
-**Example:** qwen-code, coding, complexity 3, prior 0.75. After 40 requests with 6 regenerates, 2 negative shadow comparisons and 25 cases of carrying on, α = 7.5 + 25 × 0.3 = 15.0 and β = 2.5 + 6 + 2 × 2 = 12.5. So P ≈ 0.55, clearly worse than assumed. Complexity-3 prompts then automatically go to premium more often.
+**Example:** local-coder, coding, complexity 3, prior 0.75. After 40 requests with 6 regenerates, 2 negative shadow comparisons and 25 cases of carrying on, α = 7.5 + 25 × 0.3 = 15.0 and β = 2.5 + 6 + 2 × 2 = 12.5. So P ≈ 0.55, clearly worse than assumed. Complexity-3 prompts then automatically go to premium more often.
 
-- **Decay:** Old signals lose weight (e.g. a 30-day half-life), so model updates and changing prompts are reflected. LiteLLM's adaptive router has no decay and stops updating at 200 observations per cell.
+- **Decay:** Old signals lose weight (e.g. a 30-day half-life), so model updates and changing prompts are reflected.
 - **Exploration:** Thompson sampling draws from the distribution instead of using the mean. The router therefore occasionally tries the cheap model in uncertain cells and notices when it has improved.
 
 **Getting started:** The MVP has level 0, level 1 and a golden set of about 30 prompts. Then level 2 with a 5 % sample, then level 3 with a small budget. Tenants with `privacy: local` get no shadow routing to the cloud.
@@ -312,7 +308,7 @@ prompt_improvement:
       config: {max_history_tokens: 8000}
     - plugin: llm_rewrite
       when: {directive: improve, category: [chat, summarization]}
-      config: {model: gemma4, max_similarity_drop: 0.15}
+      config: {model: local-general, max_similarity_drop: 0.15}
     - plugin: my_company.glossary      # custom plugin
   timeout_ms: 1500                     # per plugin
   ab_test: {enabled: true, share: 0.5}
@@ -349,14 +345,14 @@ The dashboard's headline figure is the saving compared with “everything to pre
 
 Technology: Streamlit for the MVP. LiteLLM's own UI and Prometheus metrics stay available alongside.
 
-## Tech stack and hardware
+## Tech stack and deployment
 
-Routeproof ships as a Python package inside the official LiteLLM proxy image, all in one Docker container. Local models run on an ASUS GX10; premium models come through the Anthropic API.
+Routeproof ships as a Python package inside the official LiteLLM proxy image, all in one Docker container. Local models run on a GPU server (for example with vLLM or Ollama); premium models come through the Anthropic API.
 
 | Component | Choice | Reason |
 | --- | --- | --- |
-| Gateway, providers | LiteLLM proxy (`ghcr.io/berriai/litellm`, pinned version, v1.105.1 in the spike) | OpenAI API, streaming, fallbacks, budgets and master key already exist |
-| Routing, directives, prompt improvement | Routeproof pre-call hook (`async_pre_call_hook`) | tested in the spike: sets `data["model"]` and changes messages |
+| Gateway, providers | LiteLLM proxy (`ghcr.io/berriai/litellm`, pinned version) | OpenAI API, streaming, fallbacks, budgets and master key already exist |
+| Routing, directives, prompt improvement | Routeproof pre-call hook (`async_pre_call_hook`) | sets `data["model"]` and changes messages |
 | Telemetry | Routeproof callback (`async_log_success_event`) | delivers messages, response, tokens, cost and tenant |
 | Classifier | sentence-transformers (bge) + scikit-learn | local, fast, retrainable |
 | Judge and shadow worker | asyncio tasks, calls through the proxy | uses the same models and the same cost tracking |
@@ -365,7 +361,7 @@ Routeproof ships as a Python package inside the official LiteLLM proxy image, al
 | Deployment | one Docker container | image based on the LiteLLM image |
 | Configuration | LiteLLM `config.yaml` + `routeproof.yaml`, secrets in `.env` |  |
 
-**One container:** All parts run in one image based on the LiteLLM image. The LLMs themselves do not run in it; the proxy calls them through their endpoints (locally on the GX10, Claude through the Anthropic API).
+**One container:** All parts run in one image based on the LiteLLM image. The LLMs themselves do not run in it; the proxy calls them through their endpoints (local models on a GPU server, Claude through the Anthropic API).
 
 | Process in the container | Task | Port |
 | --- | --- | --- |
@@ -390,151 +386,18 @@ services:
     restart: unless-stopped
 ```
 
-The LiteLLM version is pinned because hooks and logging fields can change between versions. Every update first runs against the spike tests (echo backend, 4 routing cases).
+The LiteLLM version is pinned because hooks and logging fields can change between versions. Every update first runs against a regression suite (echo backend, routing cases).
 
-**Roles on the GX10:** The 128 GB of unified memory let all models stay loaded at once. Memory bandwidth is limited, so MoE models run much faster than large dense models.
+**Example roles for local models:** With enough GPU memory, all local models can stay loaded at once. On bandwidth-limited hardware, mixture-of-experts models are often much faster than dense models of similar size. Model names below are placeholders.
 
-| Role | Model |
+| Role | Example model |
 | --- | --- |
-| Classifier (stage 1) | bge |
-| Dispatcher LLM (stage 2) | smallest variant of Qwen3.8 or Gemma4 |
-| Coding, simple to medium | qwen-code |
-| General, chat, text | Qwen3.8 / Gemma4 |
-| Judge | Gemma4 (a different model from the one being rated) |
-| Coding, complex | Claude via the Anthropic API |
-
-## Competitive landscape
-
-Several open-source projects now offer content-based routing. Closest to this concept is LiteLLM's auto routing (beta): complexity tiers, Thompson sampling, session affinity and classifier plugins. Research as of 16 Oct 2026.
-
-| Project | Type, license | Routing | Relevance |
-| --- | --- | --- | --- |
-| [LiteLLM auto routing](https://docs.litellm.ai/docs/proxy/auto_routing) | open-source gateway, MIT | tiers simple/medium/complex/reasoning via heuristic, LLM classifier, keyword rules or custom plugin; Thompson sampling, session affinity | largest overlap; Routeproof's host |
-| [vLLM Semantic Router](https://github.com/vllm-project/semantic-router) | open source, Apache-2.0 | selects or combines models per request by quality, latency and cost; guardrails | very capable, built for Envoy and Kubernetes |
-| [Plano](https://github.com/katanemo/archgw) (Katanemo) | open-source proxy on Envoy, Apache-2.0 | preference-based routing with a 4B routing model, OpenTelemetry | preferences rather than cost/quality |
-| [RouteLLM](https://github.com/lm-sys/RouteLLM) (LMSYS) | framework with OpenAI server, Apache-2.0 | binary strong/weak, e.g. matrix factorization | research basis; little maintenance since 2024 according to third parties |
-| [NadirClaw](https://dev.to/getnadir/nadirclaw-getting-started-in-5-minutes-ne9) | OpenAI-compatible proxy, MIT | embedding classifier (about 10 ms), verify-and-escalate, Docker with Ollama | very similar cascade, small project |
-| [Semantic Router](https://github.com/aurelio-labs/semantic-router) (Aurelio Labs) | Python library, MIT | embedding routes from example utterances with a threshold | building block for stage 1 |
-| [Bifrost](https://github.com/maximhq/bifrost) (Maxim) | gateway in Go with web UI, Apache-2.0 | fallbacks, load balancing, semantic cache, plugins | gateway alternative, no complexity routing in the README |
-| [Portkey Gateway](https://github.com/Portkey-AI/gateway) | gateway, MIT | fallbacks, retries, load balancing, conditional routing, guardrails | no content-based routing in the open-source version |
-| [OpenRouter auto router](https://openrouter.ai/docs/guides/routing/routers/auto-router) | SaaS | about 30 task types; ranks models by all users' spend share over the last 7 days; no surcharge | no self-hosted endpoints mentioned |
-| [Not Diamond](https://www.notdiamond.ai/) | commercial | predicts the right model per input | pricing on request |
-
-Martian, often named as a routing vendor, now describes itself on its [own website](https://withmartian.com/) as a research team with no visible routing product.
-
-**Gaps this concept fills:** No project reviewed combines all four:
-
-1. Quality measurement with shadow routing and a pairwise judge that keeps calibrating the quality matrix
-2. A dashboard with a Pareto view of cost vs. quality, split by tenant
-3. Directives in the prompt with policy precedence
-4. Prompt improvement plugins with A/B measurement per plugin
-
-**Consequence:** Routeproof builds on LiteLLM as a plugin instead of running its own gateway, and focuses on the four points above. Star counts and maintenance status come partly from third-party sources and should be checked before relying on them.
-
-## Feature matrix
-
-Routeproof differs mainly in quality measurement, the dashboard, directives and prompt improvement. Its gateway features come from LiteLLM, its host. Rating: **yes** · **partly** · **no** · **?** = not documented in the sources read. Bifrost, Portkey and Plano are left out because they document no content-based complexity routing.
-
-### Basics
-
-| Feature | Routeproof | LiteLLM | vLLM SR | Switchyard | NadirClaw | RouteLLM | OpenRouter |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| OpenAI-compatible API | yes (via LiteLLM) | yes | yes | yes (+ Anthropic) | yes | yes | yes |
-| Local models | yes | yes | yes | ? | yes (Ollama) | yes | no |
-| Any number of models | yes | yes (pools per tier) | yes | yes (pool) | partly | no (2 models) | yes (catalog) |
-| Self-hosted, one container | yes | yes | partly (Envoy, K8s) | partly (Dockerfile) | yes | yes | no (SaaS) |
-| License | MIT | MIT | Apache-2.0 | Apache-2.0 | MIT | Apache-2.0 | proprietary |
-
-### Analysis and routing
-
-| Feature | Routeproof | LiteLLM | vLLM SR | Switchyard | NadirClaw | RouteLLM | OpenRouter |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Category detection | yes, configurable | partly (keyword rules, 7 request types) | yes | no | ? | no | yes (about 30 types) |
-| Complexity rating | yes (1–5) | yes (4 tiers) | partly | partly (is the cheap model enough?) | yes | yes (strong/weak) | partly (cost\_tier) |
-| Cascade rules → embeddings → LLM | yes | partly (heuristic or LLM) | ? | partly | partly (embeddings) | no | ? |
-| Custom classifier plugins | yes | yes | ? | yes (on own data) | no | partly (trainable) | no |
-| Cost/quality utility with λ | yes | yes (adaptive router weights) | partly (priorities) | partly | no | partly (threshold) | partly |
-| Escalation on a poor answer | yes | partly (context window) | ? | yes | yes (verify-and-escalate) | no | partly (fallbacks) |
-| Session stickiness | yes | yes (optional) | ? | ? | ? | no | ? |
-| Directives in the prompt | yes | partly (keyword rules, min quality tier header) | ? | ? | ? | no | no |
-| Policies (local only, budget) | yes | yes (budgets) | partly (PII) | ? | ? | no | partly (max\_price) |
-
-### Measurement and dashboard
-
-| Feature | Routeproof | LiteLLM | vLLM SR | Switchyard | NadirClaw | RouteLLM | OpenRouter |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Token and cost logging per model | yes (via LiteLLM) | yes | ? | ? | ? | no | yes |
-| Tenants, cost centers | yes (labels) | yes (teams, keys) | ? | ? | partly (paid tier) | no | partly |
-| Learns from feedback | yes (beta with decay) | partly (adaptive router, regex signals, no decay) | ? | partly (execution signals) | partly (paid tier) | partly (offline) | partly (market data) |
-| Shadow routing, judge | yes | no (not in the adaptive router) | ? | ? | ? | no | no |
-| Pareto dashboard cost vs. quality | yes | ? | ? | ? | ? | no | no |
-
-### Prompts and maturity
-
-| Feature | Routeproof | LiteLLM | vLLM SR | Switchyard | NadirClaw | RouteLLM | OpenRouter |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Prompt improvement plugins | yes | ? | ? | ? | ? | no | no |
-| Guardrails, PII | via LiteLLM | yes | yes | ? | ? | no | ? |
-| Maturity | concept, spike done | beta feature in an established project | active, about 6.2k stars | pre-1.0, about 3.4k stars | small, about 430 stars | about 5.6k stars, little maintenance | in production |
-
-Sources: see the links in the competitive landscape section, plus [NVIDIA Switchyard](https://github.com/NVIDIA-NeMo/Switchyard). The LiteLLM column includes what the spike found in the source code of v1.105.1. The many question marks are items to check in a closer evaluation, not a statement that the feature is missing.
-
-## Conclusion and repositioning
-
-Another standalone router with its own gateway is hard to justify. A measurement and optimization layer on top of LiteLLM fills a gap in the market instead. Routeproof is therefore repositioned: LiteLLM routes, Routeproof measures whether the routing was right and calibrates it.
-
-**Not a differentiator:** Core routing is standard. LiteLLM auto routing offers complexity tiers, classifier plugins, Thompson sampling, session affinity, budgets and teams. NadirClaw, vLLM Semantic Router and NVIDIA Switchyard cover similar principles. At the same time, a gateway of one's own is the hardest part to operate (streaming, tool calls, provider quirks).
-
-| Differentiator | Strength | Reason |
-| --- | --- | --- |
-| Quality measurement with shadow routing and a pairwise judge | strong | Others route by estimate or by other users' behavior. Nobody measures whether the cheap model was good enough for your own prompts. |
-| Pareto dashboard cost vs. quality | strong | Everyone shows cost; nobody shows what the saving cost in quality. |
-| Prompt improvement plugins with A/B per plugin | medium | New, but risky and only useful once measurement is running. |
-| Directives with policy precedence | weak | Quickly rebuilt with keyword rules or a pre-call hook. |
-| Local-first, one container | weak | NadirClaw and LiteLLM offer this too. |
-
-**Positioning:** “LiteLLM routes. Routeproof proves it.” Routeproof plugs into LiteLLM's extension points and stays one container (LiteLLM proxy and Routeproof in one image).
-
-![Repositioning: Routeproof as a layer on LiteLLM](docs/images/litellm-integration.png)
-
-Calibration feeds measured quality back into routing inside the hook. That closes the loop of measuring, calibrating and routing.
-
-**Advantages:** a much smaller MVP with no gateway or provider code of its own; building on an established project instead of competing with it; clear positioning.
-
-**Risks:** LiteLLM hooks and logging fields can change between versions, so the version is pinned. LiteLLM could add quality measurement itself; the calibration logic could then be contributed upstream.
-
-**Decision (16 Oct 2026):** The spike answered all four questions with yes. Routeproof takes path B: its own routing in the LiteLLM proxy's pre-call hook. Architecture, tech stack and roadmap have been updated accordingly.
-
-## Spike results (LiteLLM 1.105.1)
-
-The repositioning holds: through stable proxy hooks, Routeproof can pick the model, change prompts and capture all measurement data. At the same time, LiteLLM already contains an adaptive router with much of the planned quality logic. Routeproof's differentiation narrows to the judge, shadow routing, calibration with decay, the Pareto dashboard and prompt plugins.
-
-Tested on 16 Oct 2026 locally (macOS, arm64) with an OpenAI-compatible echo backend instead of real models. The backend returns the model name and the messages it received, so routing and prompt changes can be verified.
-
-| Question | Result | Finding |
-| --- | --- | --- |
-| 1 Pick a specific model | yes | `async_pre_call_hook` sets `data["model"]` for the alias `routeproof`; 4 of 4 test cases reached the expected model. The auto routing `ClassifierPlugin` only returns tiers; a `RoutingPlugin` can narrow candidates (not tested). |
-| 2 Change messages | yes | Directives were stripped before forwarding; the backend received the cleaned prompt. |
-| 3 Callbacks deliver measurement data | yes | `standard_logging_object` contains messages, response, tokens, cost, `model_group`, `end_user`, `session_id` and `trace_id`. Custom metadata (routing cause, `X-Tenant` header) reaches the callback. |
-| 4 One container | yes (local) | Image based on `ghcr.io/berriai/litellm:v1.105.1` plus the hook; 4 of 4 cases passed in the container, events written, two processes, about 600 MB RAM. Architecture arm64 like the GX10, but not tested there. Docker Hub was unreachable during the test; ghcr.io worked. |
-
-**New findings:**
-
-- **An adaptive router already exists** (`auto_router/adaptive_router`): 7 request types, beta distribution with Thompson sampling per (type, model), score from quality × weight + cost × weight, passive signals from regex and tool calls, conversation detection by hash. By its own documentation it lacks an LLM judge, embeddings, latency in the score and decay (hard cap at 200 observations per cell).
-- **No public feedback path:** External signals (judge, shadow) can only be fed into the bandit through internal attributes. A feedback endpoint would be an obvious upstream contribution.
-- **Master key required:** The proxy does not start without `LITELLM_MASTER_KEY`. Using the API key as a tenant label is out; tenants come from the `user` field or the `X-Tenant` header (both tested), or from virtual keys with a database.
-- **Postgres for router state:** The adaptive router stores its state only in Postgres; the state endpoint fails without it. SQLite is not enough.
-- **Savings are already computed:** The callback data includes fields such as `autorouter_savings`, a possible basis for the dashboard.
-- **Not tested:** streaming, tool calls, the Anthropic endpoint, real models on the GX10.
-
-**Consequence, two paths:**
-
-| Path | Description | Advantage | Drawback |
-| --- | --- | --- | --- |
-| A Feed the adaptive router | Routeproof measures (judge, shadow) and feeds results into LiteLLM's bandit | least code, close to LiteLLM | today only through internal attributes; needs an upstream feedback API |
-| B Own routing in the hook | Routeproof picks the model in the pre-call hook with its own quality matrix | only stable, tested hooks; decay, latency, judge freely designed | duplicates parts of the adaptive router |
-
-**Decision:** Path B (decided on 16 Oct 2026), because it works today. In parallel, propose a feedback endpoint for the adaptive router to LiteLLM; if it is accepted, consider switching to path A.
+| Classifier (stage 1) | a small embedding model, e.g. bge |
+| Dispatcher LLM (stage 2) | `local-small`: a small, fast instruction model |
+| Coding, simple to medium | `local-coder`: a local code model |
+| General, chat, text | `local-general`: a mid-sized general model |
+| Judge | a local model from a different family than the one being rated |
+| Coding, complex | a premium cloud model, e.g. Claude via the Anthropic API |
 
 ## Roadmap
 
@@ -543,23 +406,3 @@ The MVP builds on the LiteLLM proxy with the Routeproof hook and delivers cost a
 ![Roadmap: 5 phases, no dates](docs/images/roadmap.png)
 
 Prompt improvement by LLM rewrite comes last on purpose, because its effect can only be judged once quality measurement is running.
-
-## Open items
-
-- [x] Spike against LiteLLM (see spike results):
-  - [x] Can Routeproof pick a specific model? Yes, through the pre-call hook.
-  - [x] Can a pre-call hook change messages? Yes.
-  - [x] Do the callbacks deliver the needed measurement data? Yes.
-  - [x] Do the LiteLLM proxy and Routeproof run in one container? Yes, locally on arm64.
-- [x] Decide path A or B: path B; architecture, tech stack and roadmap updated
-- [ ] Test the container on the GX10 with real models (including streaming and tool calls)
-- [ ] Propose a feedback endpoint for the adaptive router to LiteLLM as an issue
-- [ ] Decide on Postgres inside the container or external
-- [ ] Secure namespaces: GitHub org `routeproof`, PyPI `routeproof`, Docker Hub `routeproof` (all free on 16 Oct 2026)
-- [ ] Trademark check for “Routeproof” (DPMA, EUIPO)
-- [ ] State in the README: community project, not affiliated with BerriAI
-- [ ] Record actual model sizes and serving stack on the GX10 (vLLM, Ollama, llama.cpp)
-- [ ] Enter current Anthropic model prices in the LiteLLM config
-- [ ] Build a golden set of about 30 typical prompts
-- [ ] Review signal weights and decay after the first weeks of operation
-- [ ] Add a LICENSE file (MIT) to the repository
